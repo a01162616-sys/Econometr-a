@@ -1,0 +1,1342 @@
+---
+title: "Proyecto Final — Econometría Financiera"
+subtitle: "Modelos econométricos para la gestión de un portafolio de 10 acciones de EE.UU."
+author: "Natali Maya Landa"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+  word_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+options(getSymbols.warning4.0 = FALSE, scipen = 999)
+```
+
+**Maestría en Finanzas (MEF) — EGADE Business School, Tecnológico de Monterrey**
+**Materia:** Econometría Financiera (FZ4038)
+
+# Introducción
+
+## Objetivo del proyecto
+
+Aplicar modelos econométricos (regresión lineal simple y múltiple, datos panel, series de
+tiempo ARIMA y modelos de volatilidad GARCH) a un portafolio de 10 acciones de EE.UU. para
+entender su riesgo, evaluar si su comportamiento es predecible y sustentar con evidencia la
+estrategia del portafolio en el simulador HowMarketsWorks.
+
+## Acciones del portafolio
+
+| Ticker | Empresa | Sector |
+|---|---|---|
+| NVDA | NVIDIA | Tecnología / semiconductores |
+| MSFT | Microsoft | Tecnología / software |
+| AAPL | Apple | Tecnología / hardware |
+| AVGO | Broadcom | Tecnología / semiconductores |
+| AMD | Advanced Micro Devices | Tecnología / semiconductores |
+| JPM | JPMorgan Chase | Financiero / banca |
+| WMT | Walmart | Consumo defensivo |
+| XOM | Exxon Mobil | Energía |
+| V | Visa | Financiero / pagos |
+| JNJ | Johnson & Johnson | Salud / farmacéutica |
+
+Nueve acciones provienen de las actividades de clase; JNJ se incorporó para diversificar
+hacia el sector salud con una acción de bajo riesgo de mercado.
+
+## Datos y periodo
+
+| Modelo | Frecuencia | Periodo | Fuente |
+|---|---|---|---|
+| Regresión simple y múltiple | Diaria | 3-ene-2023 a 6-nov-2026 | Yahoo Finance (`quantmod`) |
+| Datos panel | Trimestral | 2023Q1 a 2026Q3 | Yahoo Finance (`quantmod`) |
+| Series de tiempo (forecast) | 1 hora y 5 minutos | dic-2023 / ago-2026 a 6-nov-2026 | Yahoo Finance (servicio de gráficas) |
+| GARCH y estrategia | Diaria | 3-ene-2023 a 6-nov-2026 | Yahoo Finance (`quantmod`) |
+
+**Nota sobre la fuente de datos:** se utilizó Yahoo Finance porque permite descargar todos
+los datos directamente desde R, lo que hace el análisis completamente reproducible. Los
+precios diarios están ajustados por splits y dividendos.
+
+## Estructura del documento
+
+Cada parte presenta los resultados para las 10 acciones en tablas resumen y profundiza en
+tres casos representativos: **NVDA** (alto riesgo de mercado), **JNJ** (bajo riesgo de
+mercado) y **WMT** (acción defensiva). Las interpretaciones indican la hipótesis nula de cada
+prueba, el nivel de significancia y su implicación para la toma de decisiones.
+
+
+# Parte 1. Regresión lineal simple y múltiple
+
+## Objetivo
+
+Analizar 10 acciones del portafolio en HowMarketsWorks con modelos econométricos para
+entender su riesgo frente al mercado y sustentar la estrategia del portafolio. Esta
+primera parte cubre la descarga de datos, el modelo de mercado (regresión simple) y una
+regresión múltiple con variables macro-financieras.
+
+## Paquetes
+
+```{r p1-paquetes}
+paquetes <- c("quantmod", "lmtest", "car", "sandwich", "knitr")
+faltan <- paquetes[!paquetes %in% installed.packages()[, "Package"]]
+if (length(faltan) > 0) install.packages(faltan)
+
+library(quantmod)   # descarga de Yahoo Finance
+library(lmtest)     # pruebas sobre residuales (Breusch-Pagan, Durbin-Watson)
+library(car)        # VIF y pruebas de hipótesis lineales
+library(sandwich)   # errores estándar robustos
+library(knitr)      # tablas
+```
+
+## Datos
+
+### Instrumentos y periodo
+
+| Tipo | Instrumentos |
+|---|---|
+| Acciones | NVDA, MSFT, AAPL, AVGO, AMD, JPM, WMT, XOM, V, JNJ |
+| Mercado | S&P 500 (^GSPC) |
+| Variables macro-financieras | VIX (^VIX), rendimiento del Treasury a 10 años (^TNX), índice dólar (DX-Y.NYB) |
+
+El periodo se fija del 1 de enero de 2023 al 6 de noviembre de 2026 para que los
+resultados no cambien cada vez que se ejecute el documento.
+
+```{r p1-descarga}
+acciones <- c("NVDA", "MSFT", "AAPL", "AVGO", "AMD",
+              "JPM", "WMT", "XOM", "V", "JNJ")
+inicio <- "2023-01-01"
+fin    <- "2026-11-07"   # Yahoo excluye la fecha final: incluye hasta el 6-nov-2026
+
+bajar <- function(simbolo) {
+  getSymbols(simbolo, src = "yahoo", from = inicio, to = fin, auto.assign = FALSE)
+}
+
+# Precios ajustados (splits y dividendos) de las 10 acciones
+precios <- NULL
+for (s in acciones) {
+  p <- Ad(bajar(s))
+  colnames(p) <- s
+  precios <- if (is.null(precios)) p else merge(precios, p)
+}
+
+# Variables de mercado
+mercado <- merge(Ad(bajar("^GSPC")), Cl(bajar("^VIX")),
+                 Cl(bajar("^TNX")),  Cl(bajar("DX-Y.NYB")))
+colnames(mercado) <- c("SPX", "VIX", "TNX", "DXY")
+
+# Se usan solo los días en que opera la bolsa de EE.UU. (calendario de las acciones).
+# VIX y DXY tienen días distintos; los huecos se llenan con el último dato disponible.
+datos <- merge(precios, mercado, join = "left")
+datos <- na.locf(datos)
+
+dim(datos)
+head(datos, 3)
+tail(datos, 3)
+```
+
+### Rendimientos y variables explicativas
+
+- **Acciones y S&P 500:** rendimiento logarítmico diario, $r_t = \ln(P_t / P_{t-1})$.
+- **VIX:** cambio diario en puntos.
+- **TNX:** cambio diario de la tasa a 10 años, en puntos porcentuales.
+- **DXY:** rendimiento logarítmico diario del dólar.
+
+```{r p1-rendimientos}
+rend <- diff(log(datos[, c(acciones, "SPX")]))
+
+dVIX <- diff(datos$VIX)
+dTNX <- diff(datos$TNX)
+dDXY <- diff(log(datos$DXY))
+cambios <- merge(dVIX, dTNX, dDXY)
+colnames(cambios) <- c("dVIX", "dTNX", "dDXY")
+
+base <- na.omit(merge(rend, cambios))
+df   <- as.data.frame(base)   # versión data.frame para las regresiones
+nrow(df)
+```
+
+### Estadística descriptiva
+
+Rendimiento y volatilidad se anualizan con 252 días hábiles.
+
+```{r p1-descriptiva}
+desc <- data.frame(
+  Serie            = c(acciones, "SPX"),
+  Rend_diario_prom = round(colMeans(base[, c(acciones, "SPX")]), 5),
+  Rend_anual       = round(colMeans(base[, c(acciones, "SPX")]) * 252, 3),
+  Vol_anual        = round(apply(base[, c(acciones, "SPX")], 2, sd) * sqrt(252), 3),
+  Minimo           = round(apply(base[, c(acciones, "SPX")], 2, min), 3),
+  Maximo           = round(apply(base[, c(acciones, "SPX")], 2, max), 3)
+)
+kable(desc, row.names = FALSE,
+      caption = "Rendimientos logarítmicos diarios (anualizados con 252 días)")
+```
+
+```{r p1-correlacion}
+kable(round(cor(base[, c(acciones, "SPX")]), 2),
+      caption = "Matriz de correlación de rendimientos diarios")
+```
+
+```{r p1-grafica-precios, fig.height=6}
+indice <- xts(sweep(coredata(datos[, acciones]), 2, as.numeric(datos[1, acciones]), "/"),
+              order.by = index(datos))
+plot.zoo(indice * 100, plot.type = "single", col = rainbow(10), lwd = 1.3,
+         xlab = "", ylab = "Base 100 = 3-ene-2023",
+         main = "Desempeño acumulado de las 10 acciones")
+legend("topleft", legend = acciones, col = rainbow(10), lwd = 2, cex = 0.7, ncol = 2)
+```
+
+**Interpretación:** NVDA tuvo el mayor rendimiento anualizado (67%), pero también una de las mayores volatilidades (47.5%), mientras que AMD es la más volátil (57%). JNJ y XOM tuvieron los rendimientos más bajos (alrededor de 14–15%) con volatilidades moderadas. La matriz de correlación muestra dos bloques: los semiconductores (NVDA, AVGO, AMD) se mueven juntos, con correlaciones de 0.51 a 0.61. En cambio, JNJ tiene correlación negativa con ellos (hasta −0.23 con NVDA), lo que indica que el portafolio sí tiene elementos de diversificación.
+
+## Regresión lineal simple: modelo de mercado
+
+Se estima para cada acción:
+
+$$r_{i,t} = \alpha_i + \beta_i \, r_{SPX,t} + \varepsilon_{i,t}$$
+
+- $\beta_i$ mide la sensibilidad de la acción al mercado: $\beta > 1$ indica una acción más
+  riesgosa que el mercado y $\beta < 1$ una acción defensiva.
+- $\alpha_i$ es el rendimiento diario no explicado por el mercado.
+- Es una versión simplificada del CAPM, porque no se resta la tasa libre de riesgo
+  (a nivel diario su efecto es muy pequeño).
+
+```{r p1-capm-todas}
+estrellas <- function(p) {
+  ifelse(p < 0.001, "***", ifelse(p < 0.01, "**",
+         ifelse(p < 0.05, "*", ifelse(p < 0.1, ".", ""))))
+}
+
+modelos_simples <- list()
+tabla_capm <- data.frame()
+
+for (s in acciones) {
+  m  <- lm(as.formula(paste(s, "~ SPX")), data = df)
+  cf <- summary(m)$coefficients
+  modelos_simples[[s]] <- m
+  tabla_capm <- rbind(tabla_capm, data.frame(
+    Accion   = s,
+    Alfa     = round(cf[1, 1], 5),
+    p_alfa   = round(cf[1, 4], 3),
+    Beta     = paste0(round(cf[2, 1], 3), estrellas(cf[2, 4])),
+    t_beta   = round(cf[2, 3], 2),
+    R2       = round(summary(m)$r.squared, 3)
+  ))
+}
+
+tabla_capm <- tabla_capm[order(-as.numeric(gsub("[^0-9.-]", "", tabla_capm$Beta))), ]
+kable(tabla_capm, row.names = FALSE,
+      caption = "Modelo de mercado por acción (ordenado de mayor a menor beta)")
+```
+
+Significancia: `***` p < 0.001, `**` p < 0.01, `*` p < 0.05, `.` p < 0.10.
+
+**Interpretación general:** La beta es significativa al 0.1% (`***`) en 9 de las 10 acciones: hay menos de 0.1% de probabilidad de observar esa relación si en realidad no existiera. La excepción es JNJ, cuya beta (0.06) no es significativa ni siquiera al 10%, por lo que no podemos afirmar que dependa del mercado. Ninguna alfa es significativa al 5%; solo NVDA (p = 0.091) y WMT (p = 0.065) lo son al 10% (`.`), lo que es evidencia débil de un rendimiento extra no explicado por el mercado. El R² va de 0.2% (JNJ) a 42% (NVDA): el mercado explica buena parte de los semiconductores y casi nada de las acciones defensivas.
+
+### Análisis a fondo: NVDA, JNJ y WMT
+
+Para las tres acciones seleccionadas se revisa el resumen completo del modelo, la prueba de
+si su beta es igual a 1 (es decir, si se mueve igual que el mercado) y los residuales.
+
+**Prueba sobre beta:** $H_0: \beta = 1$ contra $H_1: \beta \neq 1$.
+
+#### NVDA
+
+```{r p1-capm-nvda}
+summary(modelos_simples[["NVDA"]])
+linearHypothesis(modelos_simples[["NVDA"]], "SPX = 1")
+```
+
+```{r p1-capm-nvda-res, fig.height=7}
+par(mfrow = c(2, 2)); plot(modelos_simples[["NVDA"]]); par(mfrow = c(1, 1))
+```
+
+**Interpretación:** Su beta de 2.10 indica que, en promedio, si el S&P 500 sube 1%, NVDA sube 2.1%. La prueba de $H_0: \beta = 1$ da F = 194.2 con p < 0.001, así que se rechaza que se mueva igual que el mercado: es significativamente más riesgosa. La prueba F global (F = 710.9) es muy alta porque, con una sola variable explicativa, equivale a la prueba t al cuadrado (26.66² ≈ 711). Los residuales se distribuyen alrededor de cero sin patrón, pero el Q-Q plot muestra colas pesadas por eventos extremos (25-may-2023 y 27-ene-2025). Con 965 observaciones la inferencia sigue siendo razonable, pero el riesgo de saltos bruscos es alto.
+
+#### JNJ
+
+```{r p1-capm-jnj}
+summary(modelos_simples[["JNJ"]])
+linearHypothesis(modelos_simples[["JNJ"]], "SPX = 1")
+```
+
+```{r p1-capm-jnj-res, fig.height=7}
+par(mfrow = c(2, 2)); plot(modelos_simples[["JNJ"]]); par(mfrow = c(1, 1))
+```
+
+**Interpretación:** La beta de 0.06 no es significativa (p = 0.134), así que no se rechaza $H_0: \beta = 0$: el mercado no explica a JNJ (R² = 0.2%). La prueba de $H_0: \beta = 1$ sí se rechaza con fuerza (F = 554.4), lo que confirma que JNJ es claramente menos riesgosa que el mercado. Sus residuales extremos coinciden con eventos propios de la empresa (abril de 2025 y su reporte de octubre de 2026) y no con movimientos del mercado. Esto indica que su riesgo es idiosincrático y que funciona como cobertura dentro del portafolio.
+
+#### WMT
+
+```{r p1-capm-wmt}
+summary(modelos_simples[["WMT"]])
+linearHypothesis(modelos_simples[["WMT"]], "SPX = 1")
+```
+
+```{r p1-capm-wmt-res, fig.height=7}
+par(mfrow = c(2, 2)); plot(modelos_simples[["WMT"]]); par(mfrow = c(1, 1))
+```
+
+**Interpretación:** La beta de 0.37 es significativa al 0.1%, pero está muy por debajo de 1 ($H_0: \beta = 1$ se rechaza con F = 187.1). Por cada 1% que se mueve el mercado, WMT se mueve en promedio 0.37%, lo que confirma su perfil defensivo. El R² de 6% indica que el 94% de su variación proviene de factores propios de la empresa. Su alfa es marginalmente significativa al 10% (p = 0.065), una señal débil de desempeño superior al esperado por su nivel de riesgo.
+
+## Regresión lineal múltiple
+
+Se agrega al modelo de mercado el efecto de tres variables macro-financieras:
+
+$$r_{i,t} = \beta_0 + \beta_1 r_{SPX,t} + \beta_2 \Delta VIX_t + \beta_3 \Delta TNX_t + \beta_4 \Delta DXY_t + \varepsilon_{i,t}$$
+
+- **ΔVIX:** cambios en la aversión al riesgo del mercado.
+- **ΔTNX:** cambios en la tasa de interés de largo plazo.
+- **ΔDXY:** cambios en la fortaleza del dólar.
+
+**Prueba F de significancia global:** $H_0: \beta_1 = \beta_2 = \beta_3 = \beta_4 = 0$
+(ninguna variable explica el rendimiento) contra $H_1$: al menos un $\beta_j \neq 0$.
+
+```{r p1-multiple-todas}
+modelos_multiples <- list()
+tabla_mult <- data.frame()
+
+for (s in acciones) {
+  m  <- lm(as.formula(paste(s, "~ SPX + dVIX + dTNX + dDXY")), data = df)
+  sm <- summary(m)
+  cf <- sm$coefficients
+  f  <- sm$fstatistic
+  modelos_multiples[[s]] <- m
+  tabla_mult <- rbind(tabla_mult, data.frame(
+    Accion  = s,
+    SPX     = paste0(round(cf[2, 1], 3), estrellas(cf[2, 4])),
+    dVIX    = paste0(round(cf[3, 1], 4), estrellas(cf[3, 4])),
+    dTNX    = paste0(round(cf[4, 1], 4), estrellas(cf[4, 4])),
+    dDXY    = paste0(round(cf[5, 1], 3), estrellas(cf[5, 4])),
+    R2_aj   = round(sm$adj.r.squared, 3),
+    F       = round(f[1], 1),
+    p_F     = signif(pf(f[1], f[2], f[3], lower.tail = FALSE), 3)
+  ))
+}
+
+kable(tabla_mult, row.names = FALSE,
+      caption = "Regresión múltiple por acción (coeficientes y significancia)")
+```
+
+**Interpretación general:** La prueba F global rechaza $H_0$ (todos los coeficientes iguales a cero) en las 10 acciones, incluso en JNJ (F = 6.5, p < 0.001), donde el modelo simple no era significativo. El cambio en la tasa a 10 años (ΔTNX) es significativo en 7 acciones, con signo distinto según el sector: positivo en JPM y XOM, que se benefician de tasas altas, y negativo en JNJ, que se comporta como un "bono". El dólar (ΔDXY) no es significativo en ninguna acción. El signo positivo del VIX en tecnología debe leerse con cuidado: es un efecto parcial (manteniendo constante al S&P 500) y está influido por la correlación entre ambas variables.
+
+### ¿La regresión múltiple mejora al modelo simple?
+
+Prueba F de modelos anidados: $H_0$: las tres variables agregadas (ΔVIX, ΔTNX, ΔDXY) no
+aportan poder explicativo ($\beta_2 = \beta_3 = \beta_4 = 0$).
+
+```{r p1-anidados}
+tabla_anidados <- data.frame()
+for (s in acciones) {
+  a <- anova(modelos_simples[[s]], modelos_multiples[[s]])
+  tabla_anidados <- rbind(tabla_anidados, data.frame(
+    Accion      = s,
+    R2_simple   = round(summary(modelos_simples[[s]])$r.squared, 3),
+    R2_multiple = round(summary(modelos_multiples[[s]])$r.squared, 3),
+    F           = round(a$F[2], 2),
+    p_valor     = signif(a$`Pr(>F)`[2], 3),
+    Conclusion  = ifelse(a$`Pr(>F)`[2] < 0.05, "Mejora (se rechaza H0)", "No mejora")
+  ))
+}
+kable(tabla_anidados, row.names = FALSE,
+      caption = "Comparación modelo simple vs. múltiple")
+```
+
+**Interpretación:** La prueba F de modelos anidados rechaza $H_0$ en 6 de 10 acciones (NVDA, MSFT, AVGO, JPM, XOM y JNJ): en ellas, VIX, tasas y dólar sí aportan información adicional. Las mejoras de R² son pequeñas (de 0.3 a 4 puntos), pero relevantes en XOM (de 2% a 6%) y JNJ (de 0.2% a 2.6%). En AAPL, AMD, WMT y V basta el modelo simple de mercado.
+
+### Diagnóstico a fondo: NVDA, JNJ y WMT
+
+Para cada modelo se revisa:
+
+- **VIF (multicolinealidad):** valores mayores a 5 indican que las variables explicativas
+  están muy relacionadas entre sí.
+- **Breusch-Pagan (heterocedasticidad):** $H_0$: la varianza de los residuales es constante.
+- **Durbin-Watson (autocorrelación):** $H_0$: los residuales no están autocorrelacionados.
+- **Errores robustos:** si hay heterocedasticidad, se recalcula la significancia con
+  errores estándar robustos (HC1) para que las conclusiones sean confiables.
+
+```{r p1-diagnostico-funcion}
+diagnostico <- function(s) {
+  m <- modelos_multiples[[s]]
+  cat("\n==========", s, "==========\n")
+  print(summary(m))
+  cat("\n--- VIF ---\n");                       print(round(vif(m), 2))
+  cat("\n--- Breusch-Pagan ---\n");             print(bptest(m))
+  cat("\n--- Durbin-Watson ---\n");             print(dwtest(m))
+  cat("\n--- Coeficientes con errores robustos (HC1) ---\n")
+  print(coeftest(m, vcov = vcovHC(m, type = "HC1")))
+}
+```
+
+#### NVDA
+
+```{r p1-mult-nvda}
+diagnostico("NVDA")
+```
+
+```{r p1-mult-nvda-res, fig.height=7}
+par(mfrow = c(2, 2)); plot(modelos_multiples[["NVDA"]]); par(mfrow = c(1, 1))
+```
+
+**Interpretación:** Los VIF de SPX y VIX (alrededor de 3) muestran correlación moderada entre ellas, pero por debajo de 5, así que la multicolinealidad no es grave. Breusch-Pagan (p = 0.98) no rechaza varianza constante y Durbin-Watson (2.11, p = 0.96) no muestra autocorrelación, por lo que los supuestos se cumplen. Al subir la tasa a 10 años un punto porcentual, NVDA sube en promedio 3.9% (significativo al 1%, `**`), un efecto atípico para tecnología que refleja su crecimiento en periodos de economía fuerte. Los errores robustos confirman las mismas conclusiones.
+
+#### JNJ
+
+```{r p1-mult-jnj}
+diagnostico("JNJ")
+```
+
+```{r p1-mult-jnj-res, fig.height=7}
+par(mfrow = c(2, 2)); plot(modelos_multiples[["JNJ"]]); par(mfrow = c(1, 1))
+```
+
+**Interpretación:** El hallazgo clave es que la tasa a 10 años es la única variable significativa (al 0.1%): si sube un punto porcentual, JNJ cae 2.5% en promedio, porque su flujo estable y su dividendo la hacen comportarse como un bono. Breusch-Pagan sí rechaza varianza constante al 5% (p = 0.033), es decir, hay heterocedasticidad. Con errores robustos (HC1) la tasa sigue siendo significativa (p < 0.001), así que la conclusión es confiable. Durbin-Watson (2.04) no muestra autocorrelación.
+
+#### WMT
+
+```{r p1-mult-wmt}
+diagnostico("WMT")
+```
+
+```{r p1-mult-wmt-res, fig.height=7}
+par(mfrow = c(2, 2)); plot(modelos_multiples[["WMT"]]); par(mfrow = c(1, 1))
+```
+
+**Interpretación:** Solo el S&P 500 es significativo al 0.1%; la tasa lo es apenas al 10% (`.`) y con signo negativo. Breusch-Pagan (p = 0.88) y Durbin-Watson (1.93) no muestran problemas, y los VIF están por debajo de 5. La prueba de modelos anidados (p = 0.27) indica que agregar VIX, tasas y dólar no mejora el modelo: para WMT basta el modelo de mercado.
+
+
+# Parte 2. Datos panel trimestral
+
+## Objetivo
+
+Estimar con datos panel si el **riesgo** (volatilidad) y el **interés del mercado** (volumen)
+de cada acción en un trimestre anticipan su rendimiento en el trimestre siguiente,
+controlando por el movimiento del mercado y de las tasas de interés.
+
+**Nota metodológica:** el panel se construye con datos de mercado trimestrales obtenidos de
+Yahoo Finance (rendimiento, volatilidad y volumen), no con estados financieros. Se eligió
+así para tener una fuente homogénea y trimestres calendario comparables entre empresas con
+años fiscales distintos (NVDA y WMT cierran en enero, MSFT en junio, AAPL y V en septiembre).
+
+## Paquetes
+
+```{r p2-paquetes}
+paquetes <- c("quantmod", "plm", "lmtest", "sandwich", "knitr")
+faltan <- paquetes[!paquetes %in% installed.packages()[, "Package"]]
+if (length(faltan) > 0) install.packages(faltan)
+
+library(quantmod)   # descarga de Yahoo Finance
+library(plm)        # modelos de datos panel
+library(lmtest)     # coeftest
+library(sandwich)   # errores robustos
+library(knitr)      # tablas
+```
+
+## Construcción del panel
+
+- **Unidades:** 10 acciones.
+- **Periodo:** 2023Q1 a 2026Q3 (15 trimestres). Se descarga desde 2022Q4 para calcular el
+  rezago del primer trimestre; 2026Q4 se excluye por estar incompleto.
+
+**Variables:**
+
+| Variable | Definición |
+|---|---|
+| `Rend` | Rendimiento logarítmico trimestral de la acción (suma de rendimientos diarios) |
+| `Vol_lag` | Volatilidad anualizada de la acción en el trimestre **anterior** |
+| `LogVolumen_lag` | Logaritmo del volumen diario promedio en el trimestre **anterior** |
+| `Rend_SPX` | Rendimiento logarítmico trimestral del S&P 500 |
+| `dTNX` | Cambio trimestral de la tasa del Treasury a 10 años (puntos porcentuales) |
+
+```{r p2-construccion}
+acciones <- c("NVDA", "MSFT", "AAPL", "AVGO", "AMD",
+              "JPM", "WMT", "XOM", "V", "JNJ")
+inicio <- "2022-10-01"
+fin    <- "2026-10-01"   # excluye 2026Q4 (incompleto)
+
+bajar <- function(simbolo) {
+  getSymbols(simbolo, src = "yahoo", from = inicio, to = fin, auto.assign = FALSE)
+}
+
+trimestre <- function(x) as.character(as.yearqtr(index(x)))
+
+# --- Variables por acción ---
+panel <- data.frame()
+for (s in acciones) {
+  x <- bajar(s)
+  r <- diff(log(Ad(x)))
+  rq   <- apply.quarterly(r, function(z) sum(z, na.rm = TRUE))
+  volq <- apply.quarterly(r, function(z) sd(z, na.rm = TRUE) * sqrt(252))
+  vq   <- apply.quarterly(Vo(x), function(z) mean(z, na.rm = TRUE))
+  panel <- rbind(panel, data.frame(
+    Accion     = s,
+    Trimestre  = trimestre(rq),
+    Rend       = as.numeric(rq),
+    Vol        = as.numeric(volq),
+    LogVolumen = log(as.numeric(vq))
+  ))
+}
+
+# --- Variables de mercado (iguales para todas las acciones en cada trimestre) ---
+spx  <- diff(log(Ad(bajar("^GSPC"))))
+spxq <- apply.quarterly(spx, function(z) sum(z, na.rm = TRUE))
+
+tnx  <- na.omit(Cl(bajar("^TNX")))
+tnxq <- tnx[endpoints(tnx, on = "quarters")]   # nivel al cierre de cada trimestre
+dtnx <- diff(tnxq)
+
+mercado <- merge(
+  data.frame(Trimestre = trimestre(spxq), Rend_SPX = as.numeric(spxq)),
+  data.frame(Trimestre = trimestre(dtnx), dTNX = as.numeric(dtnx)),
+  by = "Trimestre"
+)
+
+panel <- merge(panel, mercado, by = "Trimestre")
+panel <- panel[order(panel$Accion, panel$Trimestre), ]
+
+# --- Rezagos dentro de cada acción ---
+rezagar <- function(z) c(NA, head(z, -1))
+panel$Vol_lag        <- ave(panel$Vol,        panel$Accion, FUN = rezagar)
+panel$LogVolumen_lag <- ave(panel$LogVolumen, panel$Accion, FUN = rezagar)
+
+# --- Muestra final: 2023Q1 a 2026Q3 ---
+panel <- panel[panel$Trimestre >= "2023 Q1" & !is.na(panel$Vol_lag), ]
+rownames(panel) <- NULL
+
+dim(panel)
+table(panel$Accion)
+head(panel)
+```
+
+## Estadística descriptiva
+
+```{r p2-descriptiva}
+vars <- c("Rend", "Vol_lag", "LogVolumen_lag", "Rend_SPX", "dTNX")
+desc <- data.frame(
+  Variable = vars,
+  Media    = round(sapply(panel[, vars], mean), 4),
+  Desv_Est = round(sapply(panel[, vars], sd), 4),
+  Minimo   = round(sapply(panel[, vars], min), 4),
+  Maximo   = round(sapply(panel[, vars], max), 4)
+)
+kable(desc, row.names = FALSE, caption = "Estadística descriptiva del panel")
+
+prom <- aggregate(cbind(Rend, Vol_lag) ~ Accion, data = panel, FUN = mean)
+prom[, 2:3] <- round(prom[, 2:3], 3)
+kable(prom, caption = "Promedios por acción (rendimiento trimestral y volatilidad)")
+```
+
+```{r p2-grafica-panel}
+boxplot(Rend ~ Accion, data = panel, col = "lightsteelblue",
+        main = "Distribución del rendimiento trimestral por acción",
+        ylab = "Rendimiento logarítmico trimestral", xlab = "")
+abline(h = 0, lty = 2, col = "red")
+```
+
+**Interpretación:** El rendimiento trimestral promedio fue de 8%, con alta dispersión (desviación estándar de 17.5%) y un trimestre extremo con rendimiento logarítmico de 1.05. NVDA (18.3%), AMD (15%) y AVGO (12.6%) tuvieron los mayores rendimientos promedio y también las mayores volatilidades (45–54% anual). JNJ, XOM y V tuvieron los rendimientos más bajos (3–4%) con volatilidades menores (17–24%). La gráfica de cajas muestra que los semiconductores tienen distribuciones mucho más amplias, lo que anticipa una relación entre riesgo y rendimiento entre acciones.
+
+## Modelos de datos panel
+
+$$Rend_{i,t} = \beta_0 + \beta_1 Vol_{i,t-1} + \beta_2 LogVolumen_{i,t-1} + \beta_3 Rend\_SPX_t + \beta_4 \Delta TNX_t + u_{i,t}$$
+
+Se estiman tres modelos:
+
+- **Pooled (MCO agrupado):** trata todas las observaciones como una sola muestra y supone
+  que todas las acciones comparten el mismo intercepto.
+- **Efectos fijos (within):** permite un intercepto propio para cada acción, que captura
+  características constantes de cada empresa (sector, tamaño, modelo de negocio).
+- **Efectos aleatorios:** supone que esas diferencias entre empresas son aleatorias y no
+  están correlacionadas con las variables explicativas.
+
+```{r p2-modelos}
+pdat <- pdata.frame(panel, index = c("Accion", "Trimestre"))
+formula_panel <- Rend ~ Vol_lag + LogVolumen_lag + Rend_SPX + dTNX
+
+m_pool <- plm(formula_panel, data = pdat, model = "pooling")
+m_fe   <- plm(formula_panel, data = pdat, model = "within")
+# Si el método estándar (Swamy-Arora) estima una varianza negativa con muestras chicas,
+# se usa el método de Wallace-Hussain como alternativa.
+m_re <- tryCatch(plm(formula_panel, data = pdat, model = "random"),
+                 error = function(e) plm(formula_panel, data = pdat, model = "random",
+                                         random.method = "walhus"))
+```
+
+### Modelo pooled
+
+```{r p2-pooled}
+summary(m_pool)
+```
+
+### Modelo de efectos fijos
+
+```{r p2-fe}
+summary(m_fe)
+```
+
+Interceptos (efectos fijos) de cada acción:
+
+```{r p2-efectos-fijos}
+kable(data.frame(Efecto_fijo = round(fixef(m_fe), 4)),
+      caption = "Intercepto propio de cada acción (efectos fijos)")
+```
+
+### Modelo de efectos aleatorios
+
+```{r p2-re}
+summary(m_re)
+```
+
+### Tabla comparativa
+
+```{r p2-comparativa}
+estrellas <- function(p) {
+  ifelse(p < 0.001, "***", ifelse(p < 0.01, "**",
+         ifelse(p < 0.05, "*", ifelse(p < 0.1, ".", ""))))
+}
+coefs <- function(m) {
+  cf <- summary(m)$coefficients
+  setNames(paste0(round(cf[, 1], 4), estrellas(cf[, 4])), rownames(cf))
+}
+filas <- c("(Intercept)", "Vol_lag", "LogVolumen_lag", "Rend_SPX", "dTNX")
+comp <- data.frame(
+  Variable        = filas,
+  Pooled          = coefs(m_pool)[filas],
+  Efectos_fijos   = coefs(m_fe)[filas],
+  Efectos_aleat   = coefs(m_re)[filas]
+)
+comp[is.na(comp)] <- "—"
+comp <- rbind(comp, data.frame(
+  Variable      = "R² ajustada",
+  Pooled        = round(summary(m_pool)$r.squared["adjrsq"], 3),
+  Efectos_fijos = round(summary(m_fe)$r.squared["adjrsq"], 3),
+  Efectos_aleat = round(summary(m_re)$r.squared["adjrsq"], 3)
+))
+kable(comp, row.names = FALSE, caption = "Comparación de los tres modelos")
+```
+
+Significancia: `***` p < 0.001, `**` p < 0.01, `*` p < 0.05, `.` p < 0.10.
+El modelo de efectos fijos no reporta intercepto general porque estima uno por acción.
+
+**Interpretación:** En los tres modelos el rendimiento del S&P 500 es significativo al 0.1%: si el mercado sube 1% en el trimestre, las acciones suben en promedio 1.1–1.14%. La volatilidad rezagada es significativa al 5% en pooled y efectos aleatorios (0.247), pero no en efectos fijos (p = 0.28), lo que indica que su efecto proviene de diferencias *entre* acciones y no de cambios *dentro* de cada una. El volumen rezagado y el cambio de tasas no son significativos en ningún modelo con errores convencionales. La prueba F global rechaza $H_0$ (todos los coeficientes iguales a cero) en los tres modelos, por ejemplo F = 10.87 con p < 0.001 en pooled. El R² ajustado del pooled (21%) es mayor que el de efectos fijos (9%), porque este último usa 9 parámetros adicionales sin ganar poder explicativo.
+
+## Selección del modelo
+
+| Prueba | Compara | $H_0$ | Si se rechaza $H_0$ |
+|---|---|---|---|
+| F de efectos individuales | Pooled vs. efectos fijos | Los interceptos de todas las acciones son iguales | Usar efectos fijos |
+| Breusch-Pagan LM | Pooled vs. efectos aleatorios | La varianza del efecto individual es cero | Usar efectos aleatorios |
+| Hausman | Efectos fijos vs. aleatorios | Los efectos individuales no están correlacionados con las variables explicativas | Usar efectos fijos |
+
+```{r p2-pruebas}
+pFtest(m_fe, m_pool)
+plmtest(m_pool, type = "bp")
+phtest(m_fe, m_re)
+```
+
+**Interpretación:** La prueba F no rechaza $H_0$ (p = 0.997): los interceptos de las 10 acciones son estadísticamente iguales, por lo que los efectos fijos no aportan. Breusch-Pagan rechaza $H_0$ apenas al 5% (p = 0.044), pero el modelo de efectos aleatorios estimó una varianza individual de cero (theta = 0), lo que lo vuelve idéntico al pooled. Hausman (p = 0.976) no rechaza $H_0$, así que entre efectos fijos y aleatorios se prefieren los aleatorios. En conjunto, el modelo elegido es el **pooled**, que en este caso es equivalente al de efectos aleatorios.
+
+## Errores estándar robustos
+
+Con datos panel es común que los errores de una misma acción estén correlacionados en el
+tiempo o tengan varianza distinta entre acciones. Se recalcula la significancia del modelo
+pooled y del de efectos fijos con errores robustos agrupados por acción (Arellano).
+
+```{r p2-robustos}
+coeftest(m_pool, vcov = vcovHC(m_pool, method = "arellano", cluster = "group"))
+coeftest(m_fe,   vcov = vcovHC(m_fe,   method = "arellano", cluster = "group"))
+```
+
+**Interpretación:** Con errores robustos agrupados por acción, en el pooled la volatilidad rezagada se vuelve significativa al 0.1% y el volumen rezagado al 5%, mientras que el S&P 500 baja a significancia al 5% porque su error estándar se duplica. Con solo 10 grupos (acciones), los errores agrupados pueden ser imprecisos, por lo que estos resultados deben leerse con cautela. En efectos fijos solo el S&P 500 sigue siendo significativo (al 5%), lo que confirma que la volatilidad no predice el rendimiento dentro de cada acción.
+
+## Conclusión de la Parte 2
+
+El factor más consistente detrás del rendimiento trimestral es el mercado: las acciones del portafolio suben o bajan con el S&P 500 casi uno a uno. Las acciones más volátiles (semiconductores) rindieron más en el periodo, lo que es consistente con una prima por riesgo, pero un aumento de volatilidad en una acción no anticipa un mayor rendimiento después. Para la estrategia, esto sugiere usar la volatilidad para dimensionar el peso de cada acción según el riesgo que se quiere asumir, no como señal de compra o venta; este punto se retoma en la sección de GARCH.
+
+**Limitación:** la relación entre volatilidad y rendimiento depende en buena medida del rally de inteligencia artificial de 2023–2024, que benefició justamente a las acciones más volátiles. En otro periodo de mercado esta relación podría no sostenerse.
+
+
+# Parte 3. Series de tiempo y forecast intradía
+
+## Objetivo
+
+Modelar el precio intradía de las 10 acciones en dos frecuencias (**1 hora** y **5 minutos**)
+con modelos ARIMA, validar su capacidad de pronóstico contra un modelo ingenuo y generar el
+pronóstico del siguiente día de operación.
+
+## Paquetes
+
+```{r p3-paquetes}
+paquetes <- c("httr", "jsonlite", "tseries", "forecast", "knitr")
+faltan <- paquetes[!paquetes %in% installed.packages()[, "Package"]]
+if (length(faltan) > 0) install.packages(faltan)
+
+library(httr)       # conexión a Yahoo Finance
+library(jsonlite)   # lectura de la respuesta
+library(tseries)    # pruebas ADF y KPSS
+library(forecast)   # auto.arima y pronósticos
+library(knitr)      # tablas
+```
+
+## Datos intradía
+
+`quantmod` solo descarga datos diarios, por lo que los datos intradía se obtienen
+directamente del servicio de Yahoo Finance, en hora de Nueva York. Yahoo solo guarda una
+ventana móvil de historia (unos 2 años en barras de 1 hora y 60 días en barras de 5 minutos),
+así que la descarga se guarda en un archivo la primera vez y después se lee de ahí, para que
+los resultados sean siempre los mismos.
+
+```{r p3-funcion-descarga}
+acciones <- c("NVDA", "MSFT", "AAPL", "AVGO", "AMD",
+              "JPM", "WMT", "XOM", "V", "JNJ")
+dia_validacion <- as.Date("2026-11-06")   # día que se usa para validar el pronóstico
+
+yahoo_intradia <- function(simbolo, intervalo, rango) {
+  url <- paste0("https://query1.finance.yahoo.com/v8/finance/chart/",
+                simbolo, "?interval=", intervalo, "&range=", rango)
+  r <- GET(url, user_agent("Mozilla/5.0"))
+  if (status_code(r) != 200) stop("HTTP ", status_code(r), " en ", simbolo)
+  j   <- fromJSON(content(r, "text", encoding = "UTF-8"))
+  res <- j$chart$result
+  data.frame(
+    fecha_hora = as.POSIXct(res$timestamp[[1]], origin = "1970-01-01",
+                            tz = "America/New_York"),
+    cierre  = res$indicators$quote[[1]]$close[[1]]
+  )
+}
+
+# Descarga una sola vez y guarda; después solo lee el archivo
+obtener <- function(intervalo, rango, archivo) {
+  if (file.exists(archivo)) return(readRDS(archivo))
+  datos <- list()
+  for (s in acciones) {
+    datos[[s]] <- yahoo_intradia(s, intervalo, rango)
+    Sys.sleep(1)   # pausa para no saturar a Yahoo
+  }
+  saveRDS(datos, archivo)
+  datos
+}
+
+# Limpieza: quita datos faltantes, la barra de cierre de las 16:00 y fechas posteriores
+# al día de validación
+limpiar <- function(d) {
+  d <- d[!is.na(d$cierre), ]
+  d <- d[format(d$fecha_hora, "%H:%M") != "16:00", ]
+  d$fecha <- as.Date(d$fecha_hora, tz = "America/New_York")
+  d[d$fecha <= dia_validacion, ]
+}
+
+h1 <- lapply(obtener("60m", "730d", "intradia_1h.rds"), limpiar)
+m5 <- lapply(obtener("5m",  "60d",  "intradia_5m.rds"), limpiar)
+```
+
+```{r p3-resumen-datos}
+resumen <- data.frame(
+  Accion       = acciones,
+  Obs_1h       = sapply(h1, nrow),
+  Desde_1h     = sapply(h1, function(d) as.character(min(d$fecha))),
+  Obs_5m       = sapply(m5, nrow),
+  Desde_5m     = sapply(m5, function(d) as.character(min(d$fecha))),
+  Hasta        = sapply(h1, function(d) as.character(max(d$fecha)))
+)
+kable(resumen, row.names = FALSE, caption = "Datos intradía disponibles por acción")
+```
+
+**Interpretación:** Se obtuvieron alrededor de 5,065 barras de 1 hora por acción (11-dic-2023 a 6-nov-2026) y 4,680 barras de 5 minutos (14-ago-2026 a 6-nov-2026), que equivalen a unos 2 años y 3 meses de operación, respectivamente. Las pequeñas diferencias en las barras de 1 hora entre acciones se deben a horas sin precio que se eliminaron. La serie de 5 minutos tiene mucho más detalle, pero cubre un periodo corto que incluye el choque de mercado del 5 de noviembre.
+
+## Metodología
+
+Para cada acción y cada frecuencia:
+
+1. **Estacionariedad.** Se aplican dos pruebas al logaritmo del precio y a sus rendimientos:
+   - **ADF:** $H_0$: la serie tiene raíz unitaria (no es estacionaria).
+   - **KPSS:** $H_0$: la serie es estacionaria.
+
+   Usar ambas da una conclusión más sólida, porque sus hipótesis nulas son opuestas.
+2. **Modelo ARIMA** sobre el logaritmo del precio, elegido automáticamente con `auto.arima`
+   (criterio de información AIC). El orden de diferenciación se limita a $d \le 1$: las
+   pruebas ADF y KPSS confirman que los rendimientos (primera diferencia) ya son
+   estacionarios, y una segunda diferencia provocó en la primera estimación pronósticos
+   que extrapolaban la tendencia (AMD y WMT en 5 minutos).
+3. **Ljung-Box** sobre los residuales: $H_0$: los residuales no están autocorrelacionados
+   (son ruido blanco), es decir, el modelo capturó toda la estructura de la serie.
+4. **Validación fuera de muestra.** Se estima el modelo con datos hasta el 5 de noviembre y
+   se pronostica el 6 de noviembre, cuyo precio real ya se conoce. Se compara el error
+   (RMSE y MAE) contra un **modelo ingenuo** que pronostica que el precio seguirá igual al
+   último observado.
+5. **Pronóstico final.** Se reestima con todos los datos y se pronostica el siguiente día
+   de operación: 7 barras de 1 hora o 78 barras de 5 minutos.
+
+```{r p3-funcion-analisis}
+analizar <- function(d) {
+  entreno <- d[d$fecha <  dia_validacion, ]
+  prueba  <- d[d$fecha == dia_validacion, ]
+  lp <- log(entreno$cierre)
+  r  <- diff(lp)
+
+  fit <- auto.arima(lp, seasonal = FALSE, max.d = 1)
+  ord <- arimaorder(fit)
+  lb  <- Box.test(residuals(fit), lag = 10, type = "Ljung-Box",
+                  fitdf = ord[1] + ord[3])
+
+  h      <- nrow(prueba)
+  pred   <- exp(as.numeric(forecast(fit, h = h)$mean))
+  ingenuo <- rep(tail(entreno$cierre, 1), h)
+  real   <- prueba$cierre
+
+  fit_total <- auto.arima(log(d$cierre), seasonal = FALSE, max.d = 1)
+  pron      <- forecast(fit_total, h = h, level = c(80, 95))
+
+  list(entreno = entreno, prueba = prueba, r = r, fit = fit, fit_total = fit_total,
+       pred = pred, ingenuo = ingenuo, real = real, pron = pron,
+       resumen = data.frame(
+         Modelo        = paste0("ARIMA(", ord[1], ",", ord[2], ",", ord[3], ")"),
+         ADF_precio    = round(adf.test(lp)$p.value, 3),
+         KPSS_precio   = round(kpss.test(lp)$p.value, 3),
+         ADF_rend      = round(adf.test(r)$p.value, 3),
+         KPSS_rend     = round(kpss.test(r)$p.value, 3),
+         LjungBox_p    = round(lb$p.value, 3),
+         RMSE_ARIMA    = round(sqrt(mean((real - pred)^2)), 3),
+         RMSE_ingenuo  = round(sqrt(mean((real - ingenuo)^2)), 3),
+         MAE_ARIMA     = round(mean(abs(real - pred)), 3),
+         MAE_ingenuo   = round(mean(abs(real - ingenuo)), 3)
+       ))
+}
+
+tabla_resultados <- function(res) {
+  t <- do.call(rbind, lapply(names(res), function(s) cbind(Accion = s, res[[s]]$resumen)))
+  t$Gana <- ifelse(t$RMSE_ARIMA < t$RMSE_ingenuo, "ARIMA",
+                   ifelse(t$RMSE_ARIMA > t$RMSE_ingenuo, "Ingenuo", "Empate"))
+  t
+}
+```
+
+Nota sobre las pruebas: `adf.test` y `kpss.test` reportan valores p acotados
+(ADF entre 0.01 y 0.99; KPSS entre 0.01 y 0.10). Un 0.01 significa "0.01 o menos" y
+un 0.1 en KPSS significa "0.10 o más".
+
+## Resultados: barras de 1 hora
+
+```{r p3-analisis-1h}
+res_1h <- lapply(h1, analizar)
+tab_1h <- tabla_resultados(res_1h)
+kable(tab_1h, row.names = FALSE,
+      caption = "Estacionariedad, modelo ARIMA y validación (1 hora, validación 6-nov-2026)")
+```
+
+**Interpretación:** KPSS rechaza estacionariedad del precio en las 10 acciones (p = 0.01) y ADF no rechaza raíz unitaria en ninguna al 5%: los precios no son estacionarios. En los rendimientos, ADF rechaza raíz unitaria (p = 0.01) y KPSS no rechaza estacionariedad, por lo que los precios son integrados de orden 1, I(1). Siete de 10 acciones resultaron ARIMA(0,1,0), es decir, una **caminata aleatoria**, en la que el mejor pronóstico es el último precio. Por eso 4 acciones empatan con el ingenuo; el ARIMA gana en 4 (NVDA, XOM, V y JNJ) con mejoras de apenas 1 a 5% en el error, y el ingenuo gana en 2 (JPM y WMT). Ljung-Box rechaza ruido blanco al 5% en AAPL, JPM y WMT, lo que indica estructura residual menor que el modelo no capturó.
+
+## Resultados: barras de 5 minutos
+
+```{r p3-analisis-5m}
+res_5m <- lapply(m5, analizar)
+tab_5m <- tabla_resultados(res_5m)
+kable(tab_5m, row.names = FALSE,
+      caption = "Estacionariedad, modelo ARIMA y validación (5 minutos, validación 6-nov-2026)")
+```
+
+**Interpretación:** Las pruebas confirman que los precios son I(1): KPSS rechaza estacionariedad del precio en las 10 acciones y los rendimientos son estacionarios. MSFT y AAPL rechazan raíz unitaria con ADF al 5%, pero KPSS contradice esa conclusión, así que se tratan como I(1). En 5 minutos aparece algo más de estructura de corto plazo (AVGO, AMD, WMT, XOM, V y JNJ tienen términos AR o MA), y el ARIMA gana en 5 de 10 acciones, aunque nuevamente por márgenes pequeños. AMD conserva autocorrelación en sus residuales (Ljung-Box p = 0.002), probablemente por su salto de 11% el 6 de noviembre.
+
+## Análisis a fondo: NVDA, JNJ y WMT
+
+```{r p3-funcion-graficas}
+graficar <- function(res, s, etiqueta) {
+  x <- res[[s]]
+  # 1. Precio y rendimientos
+  par(mfrow = c(2, 1), mar = c(3, 4, 2, 1))
+  plot(x$entreno$cierre, type = "l", col = "steelblue",
+       main = paste(s, "-", etiqueta, ": precio"), ylab = "USD", xlab = "")
+  plot(x$r, type = "l", col = "grey40",
+       main = paste(s, "-", etiqueta, ": rendimientos logarítmicos"), ylab = "", xlab = "")
+  # 2. ACF y PACF de los rendimientos
+  par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+  acf(x$r,  lag.max = 30, main = paste("ACF rendimientos", s))
+  pacf(x$r, lag.max = 30, main = paste("PACF rendimientos", s))
+  par(mfrow = c(1, 1))
+  # 3. Validación: real vs ARIMA vs ingenuo
+  rango <- range(c(x$real, x$pred, x$ingenuo))
+  plot(x$real, type = "o", pch = 16, col = "black", ylim = rango,
+       main = paste(s, "-", etiqueta, ": validación 6-nov-2026"),
+       xlab = "Barra del día", ylab = "Precio (USD)")
+  lines(x$pred,    col = "red",  lwd = 2)
+  lines(x$ingenuo, col = "blue", lwd = 2, lty = 2)
+  legend("topleft", c("Real", "ARIMA", "Ingenuo"),
+         col = c("black", "red", "blue"), lty = c(1, 1, 2), lwd = 2, cex = 0.8)
+  # 4. Pronóstico del siguiente día (en precio)
+  p <- x$pron
+  n <- length(p$x)
+  mostrar <- max(1, n - 3 * length(p$mean) + 1):n
+  plot(c(mostrar, n + seq_along(p$mean)),
+       exp(c(p$x[mostrar], p$mean)), type = "n",
+       ylim = exp(range(c(p$x[mostrar], p$lower[, 2], p$upper[, 2]))),
+       main = paste(s, "-", etiqueta, ": pronóstico del siguiente día"),
+       xlab = "Barra", ylab = "Precio (USD)")
+  polygon(c(n + seq_along(p$mean), rev(n + seq_along(p$mean))),
+          exp(c(p$lower[, 2], rev(p$upper[, 2]))), col = "grey90", border = NA)
+  polygon(c(n + seq_along(p$mean), rev(n + seq_along(p$mean))),
+          exp(c(p$lower[, 1], rev(p$upper[, 1]))), col = "grey75", border = NA)
+  lines(mostrar, exp(p$x[mostrar]), col = "steelblue", lwd = 1.5)
+  lines(n + seq_along(p$mean), exp(p$mean), col = "red", lwd = 2)
+  legend("topleft", c("Histórico", "Pronóstico", "IC 80%", "IC 95%"),
+         col = c("steelblue", "red", "grey75", "grey90"), lwd = c(2, 2, 8, 8), cex = 0.8)
+}
+```
+
+### NVDA
+
+```{r p3-nvda-1h}
+summary(res_1h[["NVDA"]]$fit)
+checkresiduals(res_1h[["NVDA"]]$fit, lag = 10)
+graficar(res_1h, "NVDA", "1 hora")
+```
+
+```{r p3-nvda-5m}
+summary(res_5m[["NVDA"]]$fit)
+graficar(res_5m, "NVDA", "5 minutos")
+```
+
+**Interpretación:** En 1 hora el modelo elegido es ARIMA(2,1,2) con deriva. Sus coeficientes AR2 (−0.887) y MA2 (0.877) son casi iguales en magnitud y de signo opuesto, por lo que prácticamente se cancelan y el modelo se comporta casi como una caminata aleatoria con deriva positiva. Ljung-Box (p = 0.54) indica que los residuales son ruido blanco, y en la validación el ARIMA le gana ligeramente al ingenuo (RMSE de 6.24 contra 6.40). En 5 minutos el modelo es directamente una caminata aleatoria, ARIMA(0,1,0).
+
+### JNJ
+
+```{r p3-jnj-1h}
+summary(res_1h[["JNJ"]]$fit)
+checkresiduals(res_1h[["JNJ"]]$fit, lag = 10)
+graficar(res_1h, "JNJ", "1 hora")
+```
+
+```{r p3-jnj-5m}
+summary(res_5m[["JNJ"]]$fit)
+graficar(res_5m, "JNJ", "5 minutos")
+```
+
+**Interpretación:** En 1 hora el modelo es una caminata aleatoria con deriva positiva (0.0001 por hora) y los residuales son ruido blanco (Ljung-Box p = 0.47). La deriva hace que le gane ligeramente al ingenuo (RMSE de 2.34 contra 2.47). En 5 minutos el modelo es ARIMA(0,1,1), con un coeficiente MA de −0.04: hay una ligera corrección del precio después de cada movimiento, y sus residuales son ruido blanco (p = 0.95).
+
+### WMT
+
+```{r p3-wmt-1h}
+summary(res_1h[["WMT"]]$fit)
+checkresiduals(res_1h[["WMT"]]$fit, lag = 10)
+graficar(res_1h, "WMT", "1 hora")
+```
+
+```{r p3-wmt-5m}
+summary(res_5m[["WMT"]]$fit)
+graficar(res_5m, "WMT", "5 minutos")
+```
+
+**Interpretación:** En 1 hora el modelo es una caminata aleatoria con deriva, pero Ljung-Box rechaza ruido blanco (p = 0.012): queda algo de estructura sin capturar, y el ingenuo le gana en la validación. En 5 minutos el modelo es ARIMA(4,1,2), más complejo, y sí le gana al ingenuo (RMSE de 1.95 contra 2.00), con residuales de ruido blanco (p = 0.147). Esto sugiere que en WMT hay patrones de muy corto plazo que solo se observan en alta frecuencia.
+
+## Pronóstico del siguiente día de operación
+
+Precio esperado al cierre del siguiente día (última barra pronosticada) con su intervalo de
+confianza al 95%, junto con el último precio observado.
+
+```{r p3-pronostico-final}
+tabla_pron <- function(res) {
+  do.call(rbind, lapply(names(res), function(s) {
+    p <- res[[s]]$pron
+    k <- length(p$mean)
+    data.frame(Accion        = s,
+               Ultimo_precio = round(tail(res[[s]]$prueba$cierre, 1), 2),
+               Pronostico    = round(exp(p$mean[k]), 2),
+               IC95_inferior = round(exp(p$lower[k, 2]), 2),
+               IC95_superior = round(exp(p$upper[k, 2]), 2),
+               Cambio_pct    = round(100 * (exp(p$mean[k]) /
+                                 tail(res[[s]]$prueba$cierre, 1) - 1), 2))
+  }))
+}
+kable(tabla_pron(res_1h), row.names = FALSE,
+      caption = "Pronóstico al cierre del siguiente día — modelo de 1 hora")
+kable(tabla_pron(res_5m), row.names = FALSE,
+      caption = "Pronóstico al cierre del siguiente día — modelo de 5 minutos")
+```
+
+**Interpretación:** Los pronósticos para el lunes 9 de noviembre son prácticamente planos: el cambio esperado va de −0.57% (AVGO, 5 minutos) a +0.25% (V, 5 minutos). Lo relevante son los intervalos de confianza al 95%, que son amplios: NVDA podría cerrar entre 177 y 198 USD y AMD entre 414 y 487 USD. Es decir, el modelo no anticipa dirección, pero sí cuantifica el rango de riesgo diario de cada acción.
+
+## Conclusión de la Parte 3
+
+Los precios intradía de las 10 acciones se comportan esencialmente como caminatas aleatorias, lo que es consistente con la hipótesis de mercados eficientes en su forma débil: los precios pasados no permiten predecir los futuros de forma rentable. El ARIMA supera al modelo ingenuo en 9 de 20 casos, pero por márgenes de 1 a 5%, insuficientes para generar ganancias después de costos de operación. El valor práctico de estos modelos está en sus intervalos de confianza, que miden el riesgo de cada acción y sirven para fijar niveles de stop-loss. Como la varianza no es constante (choque del 5 de noviembre), la Parte 4 modela directamente la volatilidad con GARCH.
+
+**Limitación:** las barras se tratan como consecutivas, aunque entre el cierre de un día y
+la apertura del siguiente hay un salto de horario (noches y fines de semana) en el que el
+precio puede moverse por noticias.
+
+
+# Parte 4. Volatilidad (GARCH) y estrategia de portafolio
+
+## Objetivo
+
+Modelar la volatilidad de las 10 acciones con GARCH(1,1), pronosticar su riesgo de corto
+plazo y usar ese pronóstico para construir el portafolio objetivo en HowMarketsWorks con un
+enfoque de **paridad de riesgo**.
+
+## Paquetes y parámetros
+
+```{r p4-paquetes}
+paquetes <- c("quantmod", "rugarch", "knitr")
+faltan <- paquetes[!paquetes %in% installed.packages()[, "Package"]]
+if (length(faltan) > 0) install.packages(faltan)
+
+library(quantmod)   # descarga de Yahoo Finance
+library(rugarch)    # modelos GARCH
+library(knitr)      # tablas
+```
+
+Parámetros de la estrategia (tomados de la cuenta de HowMarketsWorks al 7-nov-2026):
+
+```{r p4-parametros}
+acciones <- c("NVDA", "MSFT", "AAPL", "AVGO", "AMD",
+              "JPM", "WMT", "XOM", "V", "JNJ")
+
+valor_portafolio <- 998634.78   # Portfolio Value en HowMarketsWorks
+pct_invertir     <- 0.90        # porcentaje del portafolio que se invierte en acciones
+peso_maximo      <- 0.20        # peso máximo por acción
+comision         <- 10          # comisión por operación (USD)
+
+# Posiciones actuales en HowMarketsWorks (número de acciones)
+posiciones <- c(NVDA = 60, MSFT = 50, AAPL = 0, AVGO = 0, AMD = 0,
+                JPM = 41, WMT = 163, XOM = 0, V = 0, JNJ = 0)
+```
+
+## Datos
+
+Mismo periodo que la Parte 1: rendimientos logarítmicos diarios del 3 de enero de 2023 al
+6 de noviembre de 2026. Para el GARCH se expresan **en porcentaje** (multiplicados por 100),
+lo que mejora la estabilidad numérica de la estimación.
+
+```{r p4-datos}
+inicio <- "2023-01-01"
+fin    <- "2026-11-07"
+
+bajar <- function(simbolo) {
+  getSymbols(simbolo, src = "yahoo", from = inicio, to = fin, auto.assign = FALSE)
+}
+
+precios <- NULL; cierres <- c()
+for (s in acciones) {
+  x <- bajar(s)
+  p <- Ad(x); colnames(p) <- s
+  precios <- if (is.null(precios)) p else merge(precios, p)
+  cierres[s] <- as.numeric(tail(Cl(x), 1))   # último precio de cierre (sin ajustar)
+}
+spx <- Ad(bajar("^GSPC"))
+
+rend    <- na.omit(diff(log(precios))) * 100   # rendimientos en %
+rend_sp <- na.omit(diff(log(spx))) * 100
+nrow(rend)
+```
+
+## ¿Hay efecto ARCH?
+
+Antes de estimar un GARCH hay que comprobar que la volatilidad cambia en el tiempo. Se
+aplica la prueba Ljung-Box a los **rendimientos al cuadrado**:
+
+- $H_0$: no hay autocorrelación en los rendimientos al cuadrado (la varianza es constante).
+- $H_1$: hay autocorrelación (la volatilidad se agrupa: a días volátiles les siguen días volátiles).
+
+```{r p4-prueba-arch}
+arch <- data.frame(
+  Accion   = acciones,
+  Q_stat   = sapply(acciones, function(s) round(Box.test(rend[, s]^2, lag = 10, type = "Ljung-Box")$statistic, 2)),
+  p_valor  = sapply(acciones, function(s) signif(Box.test(rend[, s]^2, lag = 10, type = "Ljung-Box")$p.value, 3))
+)
+arch$Efecto_ARCH <- ifelse(arch$p_valor < 0.05, "Sí", "No")
+kable(arch, row.names = FALSE, caption = "Ljung-Box sobre rendimientos al cuadrado (10 rezagos)")
+```
+
+**Interpretación:** La prueba Ljung-Box sobre rendimientos al cuadrado rechaza $H_0$ al 5% en 6 de 10 acciones (AAPL, AVGO, AMD, JPM, XOM y V): en ellas la volatilidad se agrupa en el tiempo. En NVDA, MSFT, WMT y JNJ no se rechaza (JNJ apenas, p = 0.054). Sin embargo, esta prueba pierde potencia cuando hay saltos extremos aislados (por ejemplo, NVDA en mayo de 2023 y enero de 2025), que dominan los rendimientos al cuadrado. Como se ve en la siguiente sección, los parámetros α y β del GARCH son significativos en las 10 acciones, lo que sí confirma volatilidad cambiante en todas.
+
+## Modelos GARCH(1,1)
+
+$$r_t = \mu + \varepsilon_t, \qquad \varepsilon_t = \sigma_t z_t$$
+$$\sigma_t^2 = \omega + \alpha \, \varepsilon_{t-1}^2 + \beta \, \sigma_{t-1}^2$$
+
+- $\alpha$: qué tanto reacciona la volatilidad a un choque reciente.
+- $\beta$: qué tanto se "arrastra" la volatilidad de días anteriores.
+- $\alpha + \beta$ (**persistencia**): cerca de 1 significa que los choques de volatilidad
+  tardan mucho en disiparse.
+- **Vida media:** días que tarda un choque en reducirse a la mitad.
+
+Se estima con distribución **t-Student**, porque los residuales de la Parte 1 mostraron colas
+pesadas, y se compara con la distribución normal mediante el criterio AIC (menor es mejor).
+
+```{r p4-garch}
+spec_t <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+                     mean.model     = list(armaOrder = c(0, 0), include.mean = TRUE),
+                     distribution.model = "std")
+spec_n <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+                     mean.model     = list(armaOrder = c(0, 0), include.mean = TRUE),
+                     distribution.model = "norm")
+
+ajustes <- list(); tabla_garch <- data.frame()
+for (s in acciones) {
+  ft <- ugarchfit(spec_t, data = rend[, s], solver = "hybrid")
+  fn <- ugarchfit(spec_n, data = rend[, s], solver = "hybrid")
+  fc <- ugarchforecast(ft, n.ahead = 10)
+  ajustes[[s]] <- ft
+  cf <- coef(ft)
+  lb <- Box.test(residuals(ft, standardize = TRUE)^2, lag = 10, type = "Ljung-Box")
+  tabla_garch <- rbind(tabla_garch, data.frame(
+    Accion        = s,
+    omega         = round(cf["omega"], 4),
+    alpha         = round(cf["alpha1"], 3),
+    beta          = round(cf["beta1"], 3),
+    Persistencia  = round(persistence(ft), 3),
+    Vida_media_d  = round(halflife(ft), 1),
+    gl_t          = round(cf["shape"], 1),
+    AIC_t         = round(infocriteria(ft)[1], 3),
+    AIC_normal    = round(infocriteria(fn)[1], 3),
+    LB_resid2_p   = round(lb$p.value, 3),
+    Vol_largo_pl  = round(sqrt(uncvariance(ft) * 252) / 100, 3),
+    Vol_actual    = round(tail(sigma(ft), 1) * sqrt(252) / 100, 3),
+    Vol_pron_10d  = round(sqrt(mean(sigma(fc)^2)) * sqrt(252) / 100, 3)
+  ))
+}
+kable(tabla_garch, row.names = FALSE,
+      caption = "GARCH(1,1) con distribución t-Student (volatilidades anualizadas)")
+```
+
+Columnas: `gl_t` son los grados de libertad de la t-Student (valores bajos = colas más
+pesadas); `LB_resid2_p` es el valor p de Ljung-Box sobre los residuales estandarizados al
+cuadrado ($H_0$: el GARCH ya capturó la dinámica de la volatilidad); `Vol_largo_pl` es la
+volatilidad de largo plazo a la que el modelo regresa; `Vol_actual` es la del último día y
+`Vol_pron_10d` el promedio pronosticado para los próximos 10 días.
+
+```{r p4-tabla-sig}
+kable(data.frame(Accion = acciones,
+                 Significativos_al_5pct = sapply(acciones, function(s) {
+                   m <- ajustes[[s]]@fit$matcoef
+                   paste(rownames(m)[m[, 4] < 0.05], collapse = ", ")
+                 })),
+      row.names = FALSE, caption = "Parámetros significativos al 5% en cada modelo")
+```
+
+**Interpretación:** En las 10 acciones α y β son significativos al 5%, al igual que el parámetro de forma de la t-Student. La distribución t-Student tiene menor AIC que la normal en todos los casos, lo que confirma colas pesadas (grados de libertad de 3.7 a 8.6). La persistencia va de 0.74 (AAPL, cuyos choques se reducen a la mitad en 2.3 días) a 0.99 o más en WMT, AMD y V, donde los choques tardan meses en disiparse. Ljung-Box sobre los residuales estandarizados al cuadrado no rechaza $H_0$ en 9 de 10 acciones, es decir, el GARCH capturó la dinámica de la volatilidad; la excepción es V (p = 0.000), cuyo modelo es poco confiable. Hoy la volatilidad actual supera a la de largo plazo en casi todas las acciones, reflejo del choque del 5 de noviembre.
+
+## Análisis a fondo: NVDA, JNJ y WMT
+
+```{r p4-funcion-grafica}
+graficar_vol <- function(s) {
+  ft <- ajustes[[s]]
+  vol <- sigma(ft) * sqrt(252) / 100
+  par(mfrow = c(2, 1), mar = c(3, 4, 2, 1))
+  plot(index(rend), abs(as.numeric(rend[, s])), type = "h", col = "grey60",
+       main = paste(s, ": rendimiento absoluto diario (%)"), xlab = "", ylab = "%")
+  plot(index(rend), as.numeric(vol), type = "l", col = "red", lwd = 1.5,
+       main = paste(s, ": volatilidad condicional anualizada (GARCH)"), xlab = "", ylab = "")
+  abline(h = sqrt(uncvariance(ft) * 252) / 100, lty = 2, col = "blue")
+  legend("topright", c("Volatilidad GARCH", "Volatilidad de largo plazo"),
+         col = c("red", "blue"), lty = c(1, 2), cex = 0.8)
+  par(mfrow = c(1, 1))
+}
+```
+
+### NVDA
+
+```{r p4-nvda}
+ajustes[["NVDA"]]@fit$matcoef
+graficar_vol("NVDA")
+```
+
+**Interpretación:** El rendimiento medio diario (μ = 0.26%) es significativo al 1%, consistente con su fuerte tendencia alcista en el periodo. β = 0.885 y α = 0.060 dan una persistencia de 0.945: un choque de volatilidad se reduce a la mitad en unos 12 días. Su volatilidad actual (57% anual) está por encima de su nivel de largo plazo (46%), y el modelo pronostica que bajará gradualmente (53% en 10 días). La t-Student con 5.5 grados de libertad confirma colas pesadas: los movimientos extremos son mucho más frecuentes de lo que supondría una distribución normal.
+
+### JNJ
+
+```{r p4-jnj}
+ajustes[["JNJ"]]@fit$matcoef
+graficar_vol("JNJ")
+```
+
+**Interpretación:** Persistencia de 0.94 con vida media de 11 días, similar a NVDA, pero con volatilidad mucho menor: 25% actual contra 19% de largo plazo. Su rendimiento medio no es significativo (p = 0.13), y sus grados de libertad (4.3) indican colas pesadas asociadas a eventos propios de la empresa, como el litigio de talco. Es la segunda acción con menor volatilidad pronosticada (23.4%), lo que confirma su papel como estabilizador del portafolio.
+
+### WMT
+
+```{r p4-wmt}
+ajustes[["WMT"]]@fit$matcoef
+graficar_vol("WMT")
+```
+
+**Interpretación:** Es la acción con mayor β (0.959) y una persistencia de 0.99: su volatilidad cambia lentamente y los choques duran (vida media de 70 días). Todos sus parámetros son significativos, incluido el rendimiento medio (0.13% diario). Su volatilidad actual (27%) está cerca de la de largo plazo (21%), lo que indica que el choque reciente la afectó poco. Es una acción de riesgo bajo y estable.
+
+## Estrategia de portafolio: paridad de riesgo
+
+**Idea:** en la Parte 2 se concluyó que la volatilidad no predice el rendimiento, pero sí mide
+el riesgo. Por eso se asigna a cada acción un peso **inversamente proporcional a su volatilidad
+pronosticada por el GARCH**, para que todas aporten un riesgo parecido y ninguna domine el
+portafolio. Ninguna acción puede superar el `r peso_maximo * 100`% del portafolio invertido;
+el excedente se reparte entre las demás.
+
+```{r p4-pesos}
+vol_pron <- setNames(tabla_garch$Vol_pron_10d, tabla_garch$Accion)
+
+paridad_riesgo <- function(vol, tope) {
+  w <- (1 / vol) / sum(1 / vol)
+  repeat {
+    excede <- w > tope + 1e-12
+    if (!any(excede)) break
+    sobrante <- sum(w[excede] - tope)
+    w[excede] <- tope
+    libres <- !excede & w < tope
+    w[libres] <- w[libres] + sobrante * w[libres] / sum(w[libres])
+  }
+  w
+}
+pesos <- paridad_riesgo(vol_pron, peso_maximo)
+
+kable(data.frame(Accion = names(pesos),
+                 Vol_pronosticada = vol_pron[names(pesos)],
+                 Peso_objetivo = paste0(round(100 * pesos, 1), "%")),
+      row.names = FALSE, caption = "Pesos objetivo por paridad de riesgo (tope 20%)")
+```
+
+**Interpretación:** Las acciones menos volátiles reciben más peso: V (14.3%), JNJ (13.8%), WMT (12.2%), AAPL (11.9%) y JPM (11.7%). Las más volátiles reciben menos: AMD (3.9%), AVGO (5.5%) y NVDA (6.1%). Ninguna acción alcanzó el tope de 20%, por lo que la restricción no estuvo activa. El resultado es un portafolio con mayor peso en sectores defensivos (consumo, salud, pagos y banca) que el actual, que estaba concentrado en MSFT y NVDA.
+
+### Portafolio actual vs. propuesto
+
+Se compara el riesgo de ambos portafolios usando:
+
+- **Volatilidad:** con las volatilidades pronosticadas por el GARCH y las correlaciones
+  históricas entre acciones.
+- **Beta del portafolio:** promedio ponderado de las betas de cada acción frente al S&P 500.
+- **VaR a 1 día al 95%:** pérdida que, en condiciones normales, solo se superaría 1 de cada
+  20 días. Se calcula con aproximación normal; como hay colas pesadas, es una estimación
+  conservadoramente baja del riesgo extremo.
+
+Se muestran dos niveles: el riesgo de la **parte invertida en acciones** y el del
+**portafolio total** (incluyendo el efectivo, que no tiene riesgo de mercado).
+
+```{r p4-comparacion}
+correl <- cor(rend)
+betas  <- sapply(acciones, function(s) {
+  d <- na.omit(merge(rend[, s], rend_sp))
+  cov(d[, 1], d[, 2]) / var(d[, 2])
+})
+
+medir <- function(w_acciones, pct_acciones) {
+  v   <- vol_pron[acciones]
+  cov_a <- diag(v) %*% correl %*% diag(v)
+  vol_a <- sqrt(as.numeric(t(w_acciones) %*% cov_a %*% w_acciones))
+  vol_t <- vol_a * pct_acciones
+  c(Pct_en_acciones     = round(100 * pct_acciones, 1),
+    Vol_anual_acciones  = round(100 * vol_a, 1),
+    Vol_anual_total     = round(100 * vol_t, 1),
+    Beta_acciones       = round(sum(w_acciones * betas), 2),
+    Beta_total          = round(sum(w_acciones * betas) * pct_acciones, 2),
+    VaR95_1dia_USD      = round(1.645 * vol_t / sqrt(252) * valor_portafolio, 0))
+}
+
+valor_actual <- posiciones[acciones] * cierres[acciones]
+w_actual     <- valor_actual / sum(valor_actual)
+pct_actual   <- sum(valor_actual) / valor_portafolio
+
+comp <- rbind(Actual    = medir(w_actual, pct_actual),
+              Propuesto = medir(pesos[acciones], pct_invertir))
+kable(t(comp), caption = "Riesgo del portafolio actual vs. propuesto (volatilidades en % anual)")
+```
+
+**Interpretación:** Dentro de la parte invertida, el portafolio propuesto es menos riesgoso que el actual: volatilidad de 16.6% contra 22.1% anual y beta de 0.83 contra 0.99. Sin embargo, como pasa de tener 7.2% del capital en acciones a 90%, su riesgo total sube de 1.6% a 14.9% anual, similar al del S&P 500. El VaR a un día al 95% pasa de 1,650 a 15,417 USD: en un día normal la pérdida no debería superar 1.5% del portafolio, pero en días extremos podría ser mayor por las colas pesadas. Es el costo de poner a trabajar el capital que estaba en efectivo.
+
+### Plan de operaciones en HowMarketsWorks
+
+Monto a invertir en acciones: **`r format(round(valor_portafolio * pct_invertir), big.mark = ",")` USD**
+(`r pct_invertir * 100`% del valor del portafolio). Precios de referencia: cierre del
+6 de noviembre de 2026. El número de acciones se redondea hacia abajo.
+
+```{r p4-plan}
+objetivo_usd <- valor_portafolio * pct_invertir * pesos[acciones]
+objetivo_acc <- floor(objetivo_usd / cierres[acciones])
+diferencia   <- objetivo_acc - posiciones[acciones]
+
+plan <- data.frame(
+  Accion         = acciones,
+  Precio         = round(cierres[acciones], 2),
+  Peso_objetivo  = paste0(round(100 * pesos[acciones], 1), "%"),
+  Acciones_hoy   = posiciones[acciones],
+  Acciones_meta  = objetivo_acc,
+  Operacion      = ifelse(diferencia > 0, "Comprar",
+                          ifelse(diferencia < 0, "Vender", "Mantener")),
+  Cantidad       = abs(diferencia),
+  Monto_USD      = round(abs(diferencia) * cierres[acciones], 0)
+)
+kable(plan, row.names = FALSE, caption = "Operaciones para llegar al portafolio objetivo")
+
+n_ops     <- sum(diferencia != 0)
+flujo     <- -sum(diferencia * cierres[acciones]) - n_ops * comision
+cat("Número de operaciones:", n_ops, "| Comisiones:", n_ops * comision, "USD\n")
+cat("Cambio neto en efectivo (después de comisiones):", round(flujo, 0), "USD\n")
+```
+
+**Interpretación:** Se requieren 10 compras por un total aproximado de 825,227 USD, más 100 USD de comisiones, con lo que quedarían alrededor de 101,500 USD en efectivo (10% del portafolio). Todas las posiciones existentes aumentan, incluida NVDA (de 60 a 292 acciones): aunque su peso baja a 6.1%, el monto invertido en ella crece porque el portafolio invertido pasa de 72 mil a casi 900 mil USD. Los precios usados son los del cierre del 6 de noviembre, así que las cantidades pueden ajustarse ligeramente al ejecutar.
+
+## Conclusión de la estrategia
+
+La estrategia integra los hallazgos de todo el proyecto: los precios no son predecibles en el corto plazo (Parte 3) y la volatilidad no anticipa el rendimiento (Parte 2), pero el riesgo sí es medible y cambia en el tiempo (Parte 4). Por eso los pesos se asignan según el riesgo pronosticado por GARCH y no según expectativas de rendimiento. El portafolio resultante está diversificado en 10 acciones de 5 sectores, con beta de 0.75 sobre el total y una volatilidad similar a la del mercado. Como mejora, se recomienda rebalancear periódicamente con nuevos pronósticos de volatilidad y, dado que la volatilidad está elevada tras el choque del 5 de noviembre, considerar ejecutar las compras de forma escalonada.
+
+**Limitación:** los modelos GARCH de V y AMD tienen persistencia cercana a 1 (0.999) y, en el caso de V, sus residuales conservan dinámica de volatilidad no capturada (Ljung-Box p = 0.000). Su volatilidad pronosticada puede estar subestimada, lo que implica que el peso de V (el mayor del portafolio, 14.3%) podría ser más alto de lo que justificaría su riesgo real. Una extensión natural sería estimar modelos asimétricos (GJR-GARCH o EGARCH) para estas acciones.
+
+
+# Conclusiones generales
+
+1. **El mercado es el principal motor del rendimiento, pero no por igual.** El modelo de
+   mercado muestra tres perfiles: semiconductores con beta cercana o superior a 2 (AMD, NVDA,
+   AVGO), acciones con beta cercana a 1 (AAPL, MSFT, JPM) y acciones defensivas con beta baja
+   o no significativa (WMT, XOM, JNJ). La regresión múltiple agrega que las tasas de interés
+   importan por sector: favorecen a JPM y XOM y perjudican a JNJ, que se comporta como un bono.
+
+2. **El riesgo explica diferencias entre acciones, no cambios en el tiempo.** El panel
+   trimestral muestra que las acciones más volátiles rindieron más en el periodo, pero que un
+   aumento de volatilidad en una acción no anticipa mayor rendimiento después. Este resultado
+   depende en parte del rally de inteligencia artificial de 2023–2024.
+
+3. **Los precios intradía son prácticamente impredecibles.** Los precios son integrados de
+   orden 1 y la mayoría de los modelos ARIMA resultaron caminatas aleatorias. Cuando el ARIMA
+   superó al modelo ingenuo, lo hizo por márgenes de 1 a 5%, insuficientes para operar con
+   ganancia. Esto es consistente con la eficiencia de mercado en su forma débil.
+
+4. **La volatilidad sí es predecible y cambia en el tiempo.** Los GARCH(1,1) con distribución
+   t-Student muestran parámetros significativos en las 10 acciones, colas pesadas y alta
+   persistencia. Tras el choque del 5 de noviembre de 2026, la volatilidad de casi todas las
+   acciones está por encima de su nivel de largo plazo.
+
+5. **Implicación para la estrategia.** Como el rendimiento no se puede predecir pero el riesgo
+   sí se puede medir, el portafolio se construyó por paridad de riesgo: cada acción pesa en
+   proporción inversa a su volatilidad pronosticada. El resultado es un portafolio de 10
+   acciones y 5 sectores, con 90% del capital invertido, beta total de 0.75 y una volatilidad
+   similar a la del mercado, con mayor peso en acciones defensivas que el portafolio original.
+
+**Limitaciones y siguientes pasos:** el periodo analizado está dominado por el auge de la
+inteligencia artificial; los modelos GARCH de V y AMD tienen persistencia cercana a 1; las
+barras intradía se trataron como consecutivas pese a los saltos entre sesiones, y el VaR se
+calculó con aproximación normal. Como extensiones se proponen modelos GARCH asimétricos
+(GJR o EGARCH), un VaR con distribución t-Student y rebalanceos periódicos del portafolio con
+nuevos pronósticos de volatilidad.
+
+# Evidencia de operaciones en HowMarketsWorks
+
+**Usuario:** luna2707 · **Capital inicial:** 1,000,000 USD
+
+**Operaciones previas (septiembre–octubre 2026):** compras iniciales de AAPL, JPM, NVDA y WMT;
+el 12 de octubre se rotó parte de NVDA, JPM y AAPL hacia WMT (acción defensiva), y el 20 de
+octubre se incorporó MSFT.
+
+**Operaciones de la estrategia final:** compras de las 10 acciones según el plan de paridad
+de riesgo de la Parte 4.
+
+<!-- Para insertar las capturas: crea una carpeta llamada "capturas" junto a este archivo,
+guarda ahí las imágenes y escribe una línea por captura, por ejemplo:
+![Compra de NVDA](capturas/compra_nvda.png)
+-->
+
+# Anexos
+
+## Repositorio y archivos
+
+- **Repositorio de GitHub:** *(agregar liga)*
+- **Carpeta de Google Drive:** *(agregar liga)*
+- **Prompt de GitHub Copilot:** *(agregar)*

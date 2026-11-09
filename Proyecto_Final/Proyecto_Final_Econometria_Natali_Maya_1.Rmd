@@ -4,21 +4,41 @@ subtitle: "Modelos econométricos para la gestión de un portafolio de 10 accion
 author: "Natali Maya Landa"
 date: "`r format(Sys.Date(), '%d de %B de %Y')`"
 output:
+  word_document:
+    toc: true
+    toc_depth: 2
   html_document:
     toc: true
     toc_depth: 3
     toc_float: true
     number_sections: true
     theme: flatly
-  word_document:
-    toc: true
-    toc_depth: 2
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
                       fig.width = 9, fig.height = 5)
 options(getSymbols.warning4.0 = FALSE, scipen = 999)
+```
+
+```{r datos-guardados, include=FALSE}
+# Los precios diarios se descargan de Yahoo Finance solo la primera vez y se guardan en
+# "precios_diarios_guardados.rds". Las ejecuciones siguientes leen ese archivo, de modo que los
+# resultados no cambian cuando Yahoo recalcula precios ajustados por nuevos dividendos.
+library(quantmod)
+archivo_diarios <- "precios_diarios_guardados.rds"
+cache_diarios <- if (file.exists(archivo_diarios)) readRDS(archivo_diarios) else list()
+if (!is.list(cache_diarios) || inherits(cache_diarios, "xts")) cache_diarios <- list()
+
+bajar_guardado <- function(simbolo, desde, hasta) {
+  clave <- paste(simbolo, desde, hasta, sep = "|")
+  if (!(clave %in% names(cache_diarios))) {
+    cache_diarios[[clave]] <<- getSymbols(simbolo, src = "yahoo", from = desde, to = hasta,
+                                          auto.assign = FALSE)
+    saveRDS(cache_diarios, archivo_diarios)
+  }
+  cache_diarios[[clave]]
+}
 ```
 
 **Maestría en Finanzas (MEF) — EGADE Business School, Tecnológico de Monterrey**
@@ -62,7 +82,7 @@ hacia el sector salud con una acción de bajo riesgo de mercado.
 
 **Nota sobre la fuente de datos:** se utilizó Yahoo Finance porque permite descargar todos
 los datos directamente desde R, lo que hace el análisis completamente reproducible. Los
-precios diarios están ajustados por splits y dividendos.
+precios diarios están ajustados por splits y dividendos. Para que los resultados sean reproducibles, los datos se descargaron una sola vez y se guardaron en los archivos `precios_diarios_guardados.rds`, `intradia_1h.rds` e `intradia_5m.rds`, que se incluyen en el repositorio.
 
 ## Estructura del documento
 
@@ -115,7 +135,7 @@ inicio <- "2023-01-01"
 fin    <- "2026-11-07"   # Yahoo excluye la fecha final: incluye hasta el 6-nov-2026
 
 bajar <- function(simbolo) {
-  getSymbols(simbolo, src = "yahoo", from = inicio, to = fin, auto.assign = FALSE)
+  bajar_guardado(simbolo, inicio, fin)
 }
 
 # Precios ajustados (splits y dividendos) de las 10 acciones
@@ -461,7 +481,7 @@ inicio <- "2022-10-01"
 fin    <- "2026-10-01"   # excluye 2026Q4 (incompleto)
 
 bajar <- function(simbolo) {
-  getSymbols(simbolo, src = "yahoo", from = inicio, to = fin, auto.assign = FALSE)
+  bajar_guardado(simbolo, inicio, fin)
 }
 
 trimestre <- function(x) as.character(as.yearqtr(index(x)))
@@ -1015,7 +1035,7 @@ inicio <- "2023-01-01"
 fin    <- "2026-11-07"
 
 bajar <- function(simbolo) {
-  getSymbols(simbolo, src = "yahoo", from = inicio, to = fin, auto.assign = FALSE)
+  bajar_guardado(simbolo, inicio, fin)
 }
 
 precios <- NULL; cierres <- c()
@@ -1321,22 +1341,70 @@ nuevos pronósticos de volatilidad.
 
 **Usuario:** luna2707 · **Capital inicial:** 1,000,000 USD
 
-**Operaciones previas (septiembre–octubre 2026):** compras iniciales de AAPL, JPM, NVDA y WMT;
-el 12 de octubre se rotó parte de NVDA, JPM y AAPL hacia WMT (acción defensiva), y el 20 de
-octubre se incorporó MSFT.
+## Situación antes de la estrategia (7 de noviembre de 2026)
 
-**Operaciones de la estrategia final:** compras de las 10 acciones según el plan de paridad
-de riesgo de la Parte 4.
+Antes de aplicar la estrategia, el portafolio tenía solo 4 acciones (MSFT, WMT, NVDA y JPM)
+y 71,938 USD invertidos, es decir, 7.2% del capital; el resto estaba en efectivo. Su
+rendimiento (−0.14%) superaba al del SPY (−4.90%), pero principalmente porque la mayor parte
+del capital no estuvo expuesta a la caída del mercado, no por la selección de acciones.
+En octubre se había rotado parte de NVDA, JPM y AAPL hacia WMT y después se incorporó MSFT.
 
-<!-- Para insertar las capturas: crea una carpeta llamada "capturas" junto a este archivo,
-guarda ahí las imágenes y escribe una línea por captura, por ejemplo:
-![Compra de NVDA](capturas/compra_nvda.png)
--->
+![Saldo de la cuenta antes de la estrategia (7-nov-2026)](capturas/saldo_cuenta_7nov.png){width=90%}
+
+## Órdenes de la estrategia (7 de noviembre de 2026)
+
+Con base en el plan de paridad de riesgo de la Parte 4 se colocaron 10 órdenes de compra a
+mercado. Como el mercado estaba cerrado, el simulador las dejó pendientes y apartó
+826,487 USD como fondos restringidos para cubrirlas.
+
+![Órdenes de compra colocadas (7-nov-2026)](capturas/ordenes_7nov.png){width=90%}
+
+## Ejecución y portafolio final (9 de noviembre de 2026)
+
+Las 10 órdenes se ejecutaron el 9 de noviembre con las cantidades exactas del plan. El monto
+total de las compras fue de 830,239 USD, 0.6% más que lo estimado con los precios del 6 de
+noviembre (825,227 USD), porque algunos precios subieron antes de la apertura; el caso más
+notable fue AMD, que pasó de 449.04 a 473.54 USD (+5.5%). Con 100 USD de comisiones, el
+efectivo restante quedó en alrededor de 96,400 USD, y el valor invertido en acciones en
+alrededor de 900,000 USD, el 90% del portafolio definido en la estrategia.
+
+El mismo día de la ejecución, NVDA cayó alrededor de 7%. Como su peso en el portafolio es de
+5.6%, el impacto en el valor total fue menor a medio punto porcentual. Este es precisamente
+el objetivo de la paridad de riesgo: limitar el efecto de las acciones más volátiles.
+
+![Historial de transacciones, página 1: compras ejecutadas el 9-nov-2026](capturas/historial_transacciones.png){width=90%}
+
+```{r captura-historial-2, echo=FALSE, out.width="90%", fig.cap="Historial de transacciones, página 2: operaciones previas (septiembre–octubre 2026)"}
+# Busca la captura aunque su nombre tenga espacio, guion bajo o doble extensión
+archivo_hist2 <- list.files("capturas", pattern = "^historial_transacciones.?2", full.names = TRUE)[1]
+if (!is.na(archivo_hist2)) knitr::include_graphics(archivo_hist2)
+```
+
+![Portafolio final con las 10 acciones (9-nov-2026)](capturas/portafolio_final.png){width=90%}
+
+![Saldo de la cuenta después de la estrategia (9-nov-2026)](capturas/saldo_cuenta_final.png){width=90%}
 
 # Anexos
 
 ## Repositorio y archivos
 
-- **Repositorio de GitHub:** *(agregar liga)*
-- **Carpeta de Google Drive:** *(agregar liga)*
-- **Prompt de GitHub Copilot:** *(agregar)*
+- **Repositorio de GitHub:** <https://github.com/a01162616-sys/Econometr-a/tree/main/Proyecto_Final>
+- **Carpeta de Google Drive:** <https://drive.google.com/drive/folders/1eeCl0Wk0JKnQPLJwl1gBRltxGLMMgLxc?usp=share_link>
+- **Conversación con GitHub Copilot:** <https://github.com/copilot/share/c87a5038-4084-8651-a953-1447840d6857>
+
+**Prompt utilizado en GitHub Copilot:**
+
+> Actúa como revisor de código R especializado en econometría financiera. En el repositorio
+> a01162616-sys/Econometr-a, carpeta Proyecto_Final, está el archivo
+> Proyecto_Final_Econometria_Natali_Maya_1.Rmd. Es un proyecto que analiza 10 acciones de
+> EE.UU. (NVDA, MSFT, AAPL, AVGO, AMD, JPM, WMT, XOM, V y JNJ) con regresión lineal simple
+> y múltiple, datos panel trimestrales, modelos ARIMA con forecast intradía (1 hora y
+> 5 minutos) y modelos GARCH(1,1) para construir un portafolio por paridad de riesgo.
+> Por favor: 1) Resume la estructura del proyecto y qué hace cada parte del código.
+> 2) Revisa si el código es reproducible y señala posibles errores, riesgos o mejoras.
+> 3) Genera un archivo README.md en español para la carpeta Proyecto_Final.
+
+**Uso de Copilot en el proyecto:** Copilot generó el README del repositorio y revisó la
+reproducibilidad del código. A partir de su revisión se incorporó el guardado de los datos
+diarios en `precios_diarios_guardados.rds`, para que los resultados no cambien cuando Yahoo Finance
+recalcula precios ajustados por dividendos.
